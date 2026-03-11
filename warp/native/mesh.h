@@ -1760,13 +1760,25 @@ CUDA_CALLABLE inline bool mesh_query_ray(
     // Speculative BVH traversal with pre-tested children (HIP-only).
     Mesh mesh = mesh_get(id);
 
-    // Stack stores node index + entry distance for early termination
-    struct StackEntry {
-        int node;
-        float t_entry;
-    };
-    StackEntry stack[BVH_QUERY_STACK_SIZE];
+    // Cache frequently-accessed pointers as __restrict__ locals to help the compiler
+    // avoid reloading through multi-level struct chains and prove non-aliasing across
+    // the loop body.
+    const BVHPackedNodeHalf* __restrict__ node_lowers = mesh.bvh.node_lowers;
+    const BVHPackedNodeHalf* __restrict__ node_uppers = mesh.bvh.node_uppers;
+    const int* __restrict__ primitive_indices = mesh.bvh.primitive_indices;
+    const int* __restrict__ tri_indices = mesh.indices.data;
+    const vec3* __restrict__ points = mesh.points.data;
+
+    // SOA stack: two parallel arrays instead of an AOS StackEntry struct, reducing
+    // register-file stride and improving VGPR allocation on AMD wavefronts.
+    int stack_node[BVH_QUERY_STACK_SIZE];
+    float stack_t[BVH_QUERY_STACK_SIZE];
     int count = 0;
+
+    // Pre-compute the Woop ray-transform once per ray.  kx/ky/kz axis permutation
+    // and shear coefficients Sx/Sy/Sz are constant for the entire ray; recomputing
+    // them inside intersect_ray_tri_woop on every triangle test is pure waste.
+    const WoopRayData woop = precompute_woop(dir);
 
     const vec3 rcp_dir = vec3(1.0f / dir[0], 1.0f / dir[1], 1.0f / dir[2]);
     const float eps = 1.e-3f;
@@ -1776,17 +1788,15 @@ CUDA_CALLABLE inline bool mesh_query_ray(
     float min_u = 0.0f;
     float min_v = 0.0f;
     float min_sign = 1.0f;
-    vec3 min_normal;
 
     // Test root node first
     const int root_idx = root == -1 ? *mesh.bvh.root : root;
-    BVHPackedNodeHalf root_lower = bvh_load_node(mesh.bvh.node_lowers, root_idx);
-    BVHPackedNodeHalf root_upper = bvh_load_node(mesh.bvh.node_uppers, root_idx);
+    BVHPackedNodeHalf root_lower = bvh_load_node(node_lowers, root_idx);
+    BVHPackedNodeHalf root_upper = bvh_load_node(node_uppers, root_idx);
 
     float root_t;
     bool root_hit = intersect_ray_aabb(
-        start, rcp_dir,
-        vec3(root_lower.x - eps, root_lower.y - eps, root_lower.z - eps),
+        start, rcp_dir, vec3(root_lower.x - eps, root_lower.y - eps, root_lower.z - eps),
         vec3(root_upper.x + eps, root_upper.y + eps, root_upper.z + eps), root_t
     );
 
@@ -1794,20 +1804,20 @@ CUDA_CALLABLE inline bool mesh_query_ray(
         return false;
 
     // Push root to start traversal
-    stack[count].node = root_idx;
-    stack[count].t_entry = root_t;
+    stack_node[count] = root_idx;
+    stack_t[count] = root_t;
     count++;
 
     while (count > 0) {
-        const StackEntry entry = stack[--count];
+        const int node_index = stack_node[--count];
+        const float t_entry = stack_t[count];
 
         // Early termination: skip if this node can't improve min_t
-        if (entry.t_entry >= min_t)
+        if (t_entry >= min_t)
             continue;
 
-        const int node_index = entry.node;
-        BVHPackedNodeHalf lower = bvh_load_node(mesh.bvh.node_lowers, node_index);
-        BVHPackedNodeHalf upper = bvh_load_node(mesh.bvh.node_uppers, node_index);
+        BVHPackedNodeHalf lower = bvh_load_node(node_lowers, node_index);
+        BVHPackedNodeHalf upper = bvh_load_node(node_uppers, node_index);
 
         if (lower.b) {
             // Leaf node - test primitives
@@ -1815,26 +1825,27 @@ CUDA_CALLABLE inline bool mesh_query_ray(
             const int end_index = upper.i;
 
             for (int primitive_counter = start_index; primitive_counter < end_index; primitive_counter++) {
-                const int primitive_index = mesh.bvh.primitive_indices[primitive_counter];
-                const int i = mesh.indices[primitive_index * 3 + 0];
-                const int j = mesh.indices[primitive_index * 3 + 1];
-                const int k = mesh.indices[primitive_index * 3 + 2];
+                const int primitive_index = primitive_indices[primitive_counter];
+                const int i = tri_indices[primitive_index * 3 + 0];
+                const int j = tri_indices[primitive_index * 3 + 1];
+                const int k = tri_indices[primitive_index * 3 + 2];
 
-                const vec3 p = mesh.points[i];
-                const vec3 q = mesh.points[j];
-                const vec3 r = mesh.points[k];
+                const vec3 p = points[i];
+                const vec3 q = points[j];
+                const vec3 r = points[k];
 
                 float temp_t, temp_u, temp_v, temp_sign;
-                vec3 n;
 
-                if (intersect_ray_tri_woop(start, dir, p, q, r, temp_t, temp_u, temp_v, temp_sign, &n)) {
-                    if (temp_t < min_t && temp_t >= 0.0f) {
+                // Use the pre-computed WoopRayData overload; pass nullptr for normal
+                // since only the winning triangle needs it — the cross product is
+                // deferred to after the traversal loop to save (hits - 1) cross products.
+                if (intersect_ray_tri_woop(start, woop, p, q, r, temp_t, temp_u, temp_v, temp_sign, nullptr)) {
+                    if (temp_t >= 0.0f && temp_t < min_t) {
                         min_t = temp_t;
                         min_face = primitive_index;
                         min_u = temp_u;
                         min_v = temp_v;
                         min_sign = temp_sign;
-                        min_normal = n;
                     }
                 }
             }
@@ -1844,52 +1855,47 @@ CUDA_CALLABLE inline bool mesh_query_ray(
             const int right_idx = upper.i;
 
             // Load both children's bounds
-            BVHPackedNodeHalf left_lower = bvh_load_node(mesh.bvh.node_lowers, left_idx);
-            BVHPackedNodeHalf left_upper = bvh_load_node(mesh.bvh.node_uppers, left_idx);
-            BVHPackedNodeHalf right_lower = bvh_load_node(mesh.bvh.node_lowers, right_idx);
-            BVHPackedNodeHalf right_upper = bvh_load_node(mesh.bvh.node_uppers, right_idx);
+            BVHPackedNodeHalf left_lower = bvh_load_node(node_lowers, left_idx);
+            BVHPackedNodeHalf left_upper = bvh_load_node(node_uppers, left_idx);
+            BVHPackedNodeHalf right_lower = bvh_load_node(node_lowers, right_idx);
+            BVHPackedNodeHalf right_upper = bvh_load_node(node_uppers, right_idx);
 
-            // Test both children
-            float left_t, right_t;
+            // Test both children.  Initialise to FLT_MAX so that the unconditional
+            // do_swap comparison below never reads an uninitialised value when a
+            // child AABB misses (the original 4-way branch guarded those reads).
+            float left_t = FLT_MAX, right_t = FLT_MAX;
             const bool left_hit = intersect_ray_aabb(
-                start, rcp_dir,
-                vec3(left_lower.x - eps, left_lower.y - eps, left_lower.z - eps),
-                vec3(left_upper.x + eps, left_upper.y + eps, left_upper.z + eps), left_t
-            ) && left_t < min_t;
+                                      start, rcp_dir, vec3(left_lower.x - eps, left_lower.y - eps, left_lower.z - eps),
+                                      vec3(left_upper.x + eps, left_upper.y + eps, left_upper.z + eps), left_t
+                                  )
+                && left_t < min_t;
 
-            const bool right_hit = intersect_ray_aabb(
-                start, rcp_dir,
-                vec3(right_lower.x - eps, right_lower.y - eps, right_lower.z - eps),
-                vec3(right_upper.x + eps, right_upper.y + eps, right_upper.z + eps), right_t
-            ) && right_t < min_t;
+            const bool right_hit
+                = intersect_ray_aabb(
+                      start, rcp_dir, vec3(right_lower.x - eps, right_lower.y - eps, right_lower.z - eps),
+                      vec3(right_upper.x + eps, right_upper.y + eps, right_upper.z + eps), right_t
+                  )
+                && right_t < min_t;
 
-            // Push valid children in distance-sorted order (farther first, nearer last)
-            // This ensures we process nearer nodes first (LIFO), improving early termination
-            if (left_hit && right_hit) {
-                if (left_t < right_t) {
-                    // Left is nearer - push right first, then left
-                    stack[count].node = right_idx;
-                    stack[count].t_entry = right_t;
-                    count++;
-                    stack[count].node = left_idx;
-                    stack[count].t_entry = left_t;
-                    count++;
-                } else {
-                    // Right is nearer - push left first, then right
-                    stack[count].node = left_idx;
-                    stack[count].t_entry = left_t;
-                    count++;
-                    stack[count].node = right_idx;
-                    stack[count].t_entry = right_t;
-                    count++;
-                }
-            } else if (left_hit) {
-                stack[count].node = left_idx;
-                stack[count].t_entry = left_t;
+            // Branchless sorted push: identify near/far children via ternary ops and
+            // push far first so the near child sits on top of the LIFO stack.
+            // This replaces the 4-way nested branch that causes wavefront divergence.
+            const bool do_swap = (left_t < right_t);
+            const int near_node = do_swap ? left_idx : right_idx;
+            const float near_t = do_swap ? left_t : right_t;
+            const bool near_hit = do_swap ? left_hit : right_hit;
+            const int far_node = do_swap ? right_idx : left_idx;
+            const float far_t = do_swap ? right_t : left_t;
+            const bool far_hit = do_swap ? right_hit : left_hit;
+
+            if (far_hit) {
+                stack_node[count] = far_node;
+                stack_t[count] = far_t;
                 count++;
-            } else if (right_hit) {
-                stack[count].node = right_idx;
-                stack[count].t_entry = right_t;
+            }
+            if (near_hit) {
+                stack_node[count] = near_node;
+                stack_t[count] = near_t;
                 count++;
             }
         }
@@ -1901,7 +1907,11 @@ CUDA_CALLABLE inline bool mesh_query_ray(
         v = min_v;
         sign = min_sign;
         t = min_t;
-        normal = normalize(min_normal);
+        // Compute normal once for the winning triangle (deferred from the inner loop).
+        const int wi = tri_indices[min_face * 3 + 0];
+        const int wj = tri_indices[min_face * 3 + 1];
+        const int wk = tri_indices[min_face * 3 + 2];
+        normal = normalize(cross(points[wj] - points[wi], points[wk] - points[wi]));
         face = min_face;
         return true;
     }

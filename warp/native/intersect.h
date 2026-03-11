@@ -313,6 +313,115 @@ CUDA_CALLABLE inline float diff_product(float a, float b, float c, float d)
     return diff + error;
 }
 
+// Per-ray precomputed data for the Woop ray-triangle intersection test.
+// Compute once per ray with precompute_woop() and pass to the overloaded
+// intersect_ray_tri_woop that accepts WoopRayData to amortise the axis-
+// permutation and shear computation across all triangle tests for that ray.
+struct WoopRayData {
+    int kx, ky, kz;
+    float Sx, Sy, Sz;
+};
+
+CUDA_CALLABLE inline WoopRayData precompute_woop(const vec3& dir)
+{
+    WoopRayData w;
+    w.kz = max_dim(dir);
+    w.kx = w.kz + 1;
+    if (w.kx == 3)
+        w.kx = 0;
+    w.ky = w.kx + 1;
+    if (w.ky == 3)
+        w.ky = 0;
+    if (dir[w.kz] < 0.0f) {
+        int tmp = w.kx;
+        w.kx = w.ky;
+        w.ky = tmp;
+    }
+    w.Sx = dir[w.kx] / dir[w.kz];
+    w.Sy = dir[w.ky] / dir[w.kz];
+    w.Sz = 1.0f / dir[w.kz];
+    return w;
+}
+
+// Woop ray-triangle intersection using pre-computed ray data (WoopRayData).
+// Skips the axis-permutation and shear computation that the direction-only
+// overload performs, making this suitable for hot inner loops that test many
+// triangles against the same ray.
+CUDA_CALLABLE inline bool intersect_ray_tri_woop(
+    const vec3& p,
+    const WoopRayData& woop,
+    const vec3& a,
+    const vec3& b,
+    const vec3& c,
+    float& t,
+    float& u,
+    float& v,
+    float& sign,
+    vec3* normal
+)
+{
+    const vec3 A = a - p;
+    const vec3 B = b - p;
+    const vec3 C = c - p;
+
+    const float Ax = A[woop.kx] - woop.Sx * A[woop.kz];
+    const float Ay = A[woop.ky] - woop.Sy * A[woop.kz];
+    const float Bx = B[woop.kx] - woop.Sx * B[woop.kz];
+    const float By = B[woop.ky] - woop.Sy * B[woop.kz];
+    const float Cx = C[woop.kx] - woop.Sx * C[woop.kz];
+    const float Cy = C[woop.ky] - woop.Sy * C[woop.kz];
+
+    float U = diff_product(Cx, By, Cy, Bx);
+    float V = diff_product(Ax, Cy, Ay, Cx);
+    float W = diff_product(Bx, Ay, By, Ax);
+
+    if (U == 0.0f || V == 0.0f || W == 0.0f) {
+        double CxBy = (double)Cx * (double)By;
+        double CyBx = (double)Cy * (double)Bx;
+        U = (float)(CxBy - CyBx);
+        double AxCy = (double)Ax * (double)Cy;
+        double AyCx = (double)Ay * (double)Cx;
+        V = (float)(AxCy - AyCx);
+        double BxAy = (double)Bx * (double)Ay;
+        double ByAx = (double)By * (double)Ax;
+        W = (float)(BxAy - ByAx);
+    }
+
+    if ((U < 0.0f || V < 0.0f || W < 0.0f) && (U > 0.0f || V > 0.0f || W > 0.0f)) {
+        return false;
+    }
+
+    float det = U + V + W;
+
+    if (det == 0.0f) {
+        return false;
+    }
+
+    const float Az = woop.Sz * A[woop.kz];
+    const float Bz = woop.Sz * B[woop.kz];
+    const float Cz = woop.Sz * C[woop.kz];
+    const float T = U * Az + V * Bz + W * Cz;
+
+    int det_sign = sign_mask(det);
+    if (xorf(T, det_sign) < 0.0f) {
+        return false;
+    }
+
+    const float rcpDet = 1.0f / det;
+    u = U * rcpDet;
+    v = V * rcpDet;
+    t = T * rcpDet;
+    sign = det;
+
+    if (normal) {
+        const vec3 ab = b - a;
+        const vec3 ac = c - a;
+        *normal = cross(ab, ac);
+    }
+
+    return true;
+}
+
 // http://jcgt.org/published/0002/01/05/
 CUDA_CALLABLE inline bool intersect_ray_tri_woop(
     const vec3& p,
